@@ -1,0 +1,760 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.colors import LinearSegmentedColormap
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+from PIL import Image, ImageTk
+import matplotlib.patheffects as patheffects
+
+# MongoDB configuration
+MONGO_URI = "mongodb+srv://username:password@watermonitoringsystem.quces.mongodb.net/"
+DATABASE_NAME = "watermonitoring"
+COLLECTION_NAME = "sensordatas"
+
+# Define parameters and their ranges with severity thresholds
+PARAMETERS = {
+    "pH": {
+        "name": "pH Level", 
+        "unit": "", 
+        "range": (0, 14), 
+        "safe_range": (6.5, 8.5),
+        "severity_thresholds": {
+            "minor": (0.5, 0.5),  # ±0.5 from safe range
+            "average": (1.0, 1.0),  # ±1.0 from safe range
+            "major": (1.5, 1.5)   # ±1.5 from safe range
+        }
+    },
+    "ORP": {
+        "name": "ORP", 
+        "unit": "mV", 
+        "range": (-1000, 1000), 
+        "safe_range": (200, 800),
+        "severity_thresholds": {
+            "minor": (100, 100),
+            "average": (200, 200),
+            "major": (300, 300)
+        }
+    },
+    "TDS": {
+        "name": "TDS", 
+        "unit": "ppm", 
+        "range": (0, 2000), 
+        "safe_range": (50, 500),
+        "severity_thresholds": {
+            "minor": (100, 100),
+            "average": (200, 200),
+            "major": (300, 300)
+        }
+    },
+    "temperature": {
+        "name": "Temperature", 
+        "unit": "°C", 
+        "range": (0, 50), 
+        "safe_range": (15, 35),
+        "severity_thresholds": {
+            "minor": (2, 2),
+            "average": (5, 5),
+            "major": (8, 8)
+        }
+    },
+    "turbidity": {
+        "name": "Turbidity", 
+        "unit": "NTU", 
+        "range": (0, 100), 
+        "safe_range": (0, 5),
+        "severity_thresholds": {
+            "minor": (2, 0),  # Only upper threshold matters for turbidity
+            "average": (5, 0),
+            "major": (10, 0)
+        }
+    },
+    "water_level": {
+        "name": "Water Level", 
+        "unit": "m", 
+        "range": (0, 10), 
+        "safe_range": (2, 8),
+        "severity_thresholds": {
+            "minor": (0.5, 0.5),
+            "average": (1.0, 1.0),
+            "major": (1.5, 1.5)
+        }
+    }
+}
+
+# Define locations in Qatar (x, y coordinates)
+LOCATIONS = {
+    0: (130, 200),  # Doha
+    1: (300, 200),  # Al Khor
+    2: (250, 400)   # Al Wakrah
+}
+
+# Color map (blue = low, red = high)
+CMAP = LinearSegmentedColormap.from_list("custom", ["blue", "red"])
+
+# Alert severity colors
+SEVERITY_COLORS = {
+    "minor": "yellow",
+    "average": "orange",
+    "major": "red"
+}
+
+class WaterQualityDashboard:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Qatar Ground Water Quality Monitoring")
+        self.root.geometry("1200x800")
+        self.root.configure(bg="#f0f0f0")
+        
+        # Initialize MongoDB connection
+        self.client = MongoClient(MONGO_URI)
+        self.db = self.client[DATABASE_NAME]
+        self.collection = self.db[COLLECTION_NAME]
+        self.alerts_collection = self.db["alerts"]
+        
+        # Store last checked values to avoid duplicate alerts
+        self.last_values = {loc: {param: None for param in PARAMETERS} for loc in LOCATIONS}
+        
+        # Create main notebook
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Create all tabs
+        self.create_dashboard_tab()
+        self.create_history_tab()
+        self.create_alerts_tab()
+        
+        # Start data updates
+        self.update_data()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def create_dashboard_tab(self):
+        """Create the dashboard tab with heatmaps"""
+        self.dashboard_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.dashboard_tab, text="Dashboard")
+        
+        # Create frames for heatmaps
+        self.heatmap_frames = []
+        self.figures = []
+        self.axes = []
+        self.canvases = []
+        
+        for i, param in enumerate(PARAMETERS):
+            frame = ttk.Frame(self.dashboard_tab)
+            frame.grid(row=i//3, column=i%3, padx=10, pady=10, sticky="nsew")
+            self.heatmap_frames.append(frame)
+            
+            # Create figure and axis
+            fig = Figure(figsize=(5, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            # Create canvas
+            canvas = FigureCanvasTkAgg(fig, master=frame)
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            
+            self.figures.append(fig)
+            self.axes.append(ax)
+            self.canvases.append(canvas)
+            
+            # Configure grid weights
+            self.dashboard_tab.grid_rowconfigure(i//3, weight=1)
+            self.dashboard_tab.grid_columnconfigure(i%3, weight=1)
+
+    def create_history_tab(self):
+        """Create the history tab with time series graphs"""
+        self.history_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.history_tab, text="History")
+        
+        # Create control frame
+        control_frame = ttk.Frame(self.history_tab)
+        control_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Parameter selection
+        ttk.Label(control_frame, text="Parameter:").grid(row=0, column=0, padx=5)
+        self.hist_param_var = tk.StringVar()
+        self.hist_param_menu = ttk.Combobox(control_frame, 
+                                          textvariable=self.hist_param_var,
+                                          values=list(PARAMETERS.keys()),
+                                          state="readonly")
+        self.hist_param_menu.grid(row=0, column=1, padx=5)
+        self.hist_param_menu.current(0)
+        
+        # Time range selection
+        ttk.Label(control_frame, text="Time Range:").grid(row=0, column=2, padx=5)
+        self.time_range_var = tk.StringVar()
+        time_options = ["5 min", "10 min", "30 min", "1 hour", "6 hours", "12 hours"]
+        self.time_range_menu = ttk.Combobox(control_frame,
+                                          textvariable=self.time_range_var,
+                                          values=time_options,
+                                          state="readonly")
+        self.time_range_menu.grid(row=0, column=3, padx=5)
+        self.time_range_menu.current(2)  # Default to 30 min
+        
+        # Location selection
+        ttk.Label(control_frame, text="Location:").grid(row=0, column=4, padx=5)
+        self.location_var = tk.StringVar()
+        self.location_menu = ttk.Combobox(control_frame,
+                                        textvariable=self.location_var,
+                                        values=list(LOCATIONS.keys()),
+                                        state="readonly")
+        self.location_menu.grid(row=0, column=5, padx=5)
+        self.location_menu.current(0)
+        
+        # Update button
+        update_btn = ttk.Button(control_frame, 
+                              text="Update Graph",
+                              command=self.update_history_graph)
+        update_btn.grid(row=0, column=6, padx=10)
+        
+        # Create graph frame
+        graph_frame = ttk.Frame(self.history_tab)
+        graph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create figure and canvas
+        self.hist_fig = Figure(figsize=(8, 4), dpi=100)
+        self.hist_ax = self.hist_fig.add_subplot(111)
+        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=graph_frame)
+        self.hist_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Initial graph update
+        self.update_history_graph()
+
+    def create_alerts_tab(self):
+        """Create the alerts tab to view past alerts"""
+        self.alerts_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.alerts_tab, text="Alerts")
+        
+        # Create control frame
+        control_frame = ttk.Frame(self.alerts_tab)
+        control_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Filter by location
+        ttk.Label(control_frame, text="Location:").grid(row=0, column=0, padx=5)
+        self.alert_location_var = tk.StringVar(value="All")
+        location_options = ["All"] + [str(loc) for loc in LOCATIONS.keys()]
+        self.alert_location_menu = ttk.Combobox(control_frame,
+                                              textvariable=self.alert_location_var,
+                                              values=location_options,
+                                              state="readonly")
+        self.alert_location_menu.grid(row=0, column=1, padx=5)
+        
+        # Filter by parameter
+        ttk.Label(control_frame, text="Parameter:").grid(row=0, column=2, padx=5)
+        self.alert_param_var = tk.StringVar(value="All")
+        param_options = ["All"] + list(PARAMETERS.keys())
+        self.alert_param_menu = ttk.Combobox(control_frame,
+                                           textvariable=self.alert_param_var,
+                                           values=param_options,
+                                           state="readonly")
+        self.alert_param_menu.grid(row=0, column=3, padx=5)
+        
+        # Filter by severity
+        ttk.Label(control_frame, text="Severity:").grid(row=0, column=4, padx=5)
+        self.alert_severity_var = tk.StringVar(value="All")
+        severity_options = ["All", "Minor", "Average", "Major"]
+        self.alert_severity_menu = ttk.Combobox(control_frame,
+                                              textvariable=self.alert_severity_var,
+                                              values=severity_options,
+                                              state="readonly")
+        self.alert_severity_menu.grid(row=0, column=5, padx=5)
+        
+        # Time range filter
+        ttk.Label(control_frame, text="Time Range:").grid(row=0, column=6, padx=5)
+        self.alert_time_var = tk.StringVar(value="All")
+        time_options = ["All", "Last hour", "Last 24 hours", "Last week"]
+        self.alert_time_menu = ttk.Combobox(control_frame,
+                                          textvariable=self.alert_time_var,
+                                          values=time_options,
+                                          state="readonly")
+        self.alert_time_menu.grid(row=0, column=7, padx=5)
+        
+        # Update button
+        update_btn = ttk.Button(control_frame, 
+                              text="Filter Alerts",
+                              command=self.update_alerts_view)
+        update_btn.grid(row=0, column=8, padx=10)
+        
+        # Create treeview to display alerts
+        self.alerts_tree = ttk.Treeview(self.alerts_tab, 
+                                      columns=("timestamp", "location", "parameter", "value", "status", "severity"), 
+                                      show="headings")
+        
+        # Configure columns
+        self.alerts_tree.heading("timestamp", text="Timestamp")
+        self.alerts_tree.heading("location", text="Location")
+        self.alerts_tree.heading("parameter", text="Parameter")
+        self.alerts_tree.heading("value", text="Value")
+        self.alerts_tree.heading("status", text="Status")
+        self.alerts_tree.heading("severity", text="Severity")
+        
+        self.alerts_tree.column("timestamp", width=150)
+        self.alerts_tree.column("location", width=80)
+        self.alerts_tree.column("parameter", width=120)
+        self.alerts_tree.column("value", width=80)
+        self.alerts_tree.column("status", width=120)
+        self.alerts_tree.column("severity", width=100)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(self.alerts_tab, orient="vertical", command=self.alerts_tree.yview)
+        self.alerts_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack widgets
+        self.alerts_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Configure tags for severity coloring
+        self.alerts_tree.tag_configure('minor', background='yellow')
+        self.alerts_tree.tag_configure('average', background='orange')
+        self.alerts_tree.tag_configure('major', background='red')
+        
+        # Initial update
+        self.update_alerts_view()
+
+    def fetch_data(self):
+        """Fetch the latest data from MongoDB for all locations"""
+        data = {}
+        for location in LOCATIONS:
+            document = self.collection.find_one(
+                {"location": location},
+                sort=[('timestamp', -1)]  # Get most recent document
+            )
+            if document:
+                data[location] = document
+                # Check for alerts
+                self.check_for_alerts(location, document)
+            else:
+                # Default values if no data found
+                data[location] = {param: 0 for param in PARAMETERS}
+        return data
+
+    def check_for_alerts(self, location, data):
+        """Check if any parameter values are outside safe ranges and create alerts with severity levels"""
+        for param, value in data.items():
+            if param in PARAMETERS:
+                # Skip if value hasn't changed
+                if self.last_values[location][param] == value:
+                    continue
+                
+                self.last_values[location][param] = value
+                
+                safe_min, safe_max = PARAMETERS[param]["safe_range"]
+                thresholds = PARAMETERS[param]["severity_thresholds"]
+                
+                # Determine if value is outside safe range and severity
+                severity = None
+                status = ""
+                
+                if value < safe_min:
+                    deviation = safe_min - value
+                    # Check severity thresholds
+                    if deviation >= thresholds["major"][0]:
+                        severity = "major"
+                        status = "CRITICALLY LOW"
+                    elif deviation >= thresholds["average"][0]:
+                        severity = "average"
+                        status = "TOO LOW"
+                    elif deviation >= thresholds["minor"][0]:
+                        severity = "minor"
+                        status = "SLIGHTLY LOW"
+                        
+                elif value > safe_max:
+                    deviation = value - safe_max
+                    # Check severity thresholds
+                    if deviation >= thresholds["major"][1]:
+                        severity = "major"
+                        status = "CRITICALLY HIGH"
+                    elif deviation >= thresholds["average"][1]:
+                        severity = "average"
+                        status = "TOO HIGH"
+                    elif deviation >= thresholds["minor"][1]:
+                        severity = "minor"
+                        status = "SLIGHTLY HIGH"
+                
+                if severity:
+                    # Check if similar alert already exists in the last minute
+                    recent_alert = self.alerts_collection.find_one({
+                        "location": location,
+                        "parameter": param,
+                        "timestamp": {"$gt": datetime.utcnow() - timedelta(minutes=1)},
+                        "severity": severity
+                    })
+                    
+                    if not recent_alert:
+                        # Create new alert
+                        alert = {
+                            "timestamp": datetime.utcnow(),
+                            "location": location,
+                            "parameter": param,
+                            "value": value,
+                            "status": status,
+                            "severity": severity,
+                            "safe_min": safe_min,
+                            "safe_max": safe_max
+                        }
+                        self.alerts_collection.insert_one(alert)
+                        
+                        # Show alert to user based on severity
+                        self.show_alert_notification(location, param, value, status, severity)
+
+    def show_alert_notification(self, location, param, value, status, severity):
+        """Show a popup notification for an alert with severity-based styling"""
+        param_name = PARAMETERS[param]["name"]
+        unit = PARAMETERS[param]["unit"]
+        safe_min, safe_max = PARAMETERS[param]["safe_range"]
+        
+        message = (
+            f"ALERT: {param_name} at Location {location} is {status}!\n\n"
+            f"Current value: {value:.2f} {unit}\n"
+            f"Safe range: {safe_min:.2f} - {safe_max:.2f} {unit}\n"
+            f"Severity: {severity.upper()}"
+        )
+        
+        # Create custom dialog based on severity
+        alert_window = tk.Toplevel(self.root)
+        alert_window.title(f"Water Quality Alert ({severity.upper()})")
+        
+        # Set window color based on severity
+        alert_window.configure(bg=SEVERITY_COLORS[severity])
+        
+        # Add message
+        msg_label = tk.Label(alert_window, text=message, font=('Helvetica', 12), 
+                            bg=SEVERITY_COLORS[severity], padx=20, pady=20)
+        msg_label.pack()
+        
+        # Add OK button
+        ok_button = tk.Button(alert_window, text="OK", command=alert_window.destroy,
+                            font=('Helvetica', 10, 'bold'))
+        ok_button.pack(pady=10)
+        
+        # Set window position and make it modal
+        alert_window.transient(self.root)
+        alert_window.grab_set()
+        
+        # For critical alerts, make the window more prominent
+        if severity == "major":
+            alert_window.attributes('-topmost', True)
+            # Flash the window in taskbar (Windows only)
+            try:
+                alert_window.iconbitmap(default='')  # Needed for flashing to work
+                alert_window.wm_attributes("-topmost", 1)
+                alert_window.wm_attributes("-topmost", 0)
+            except:
+                pass
+        
+        # Also print to console for logging
+        print(f"[{severity.upper()} ALERT] {datetime.now()} - {message}")
+
+    def update_alerts_view(self):
+        """Update the alerts treeview with filtered alerts"""
+        # Clear existing items
+        for item in self.alerts_tree.get_children():
+            self.alerts_tree.delete(item)
+        
+        # Build query based on filters
+        query = {}
+        
+        # Location filter
+        location_filter = self.alert_location_var.get()
+        if location_filter != "All":
+            query["location"] = int(location_filter)
+        
+        # Parameter filter
+        param_filter = self.alert_param_var.get()
+        if param_filter != "All":
+            query["parameter"] = param_filter
+        
+        # Time filter
+        time_filter = self.alert_time_var.get()
+        if time_filter != "All":
+            if time_filter == "Last hour":
+                time_delta = timedelta(hours=1)
+            elif time_filter == "Last 24 hours":
+                time_delta = timedelta(days=1)
+            elif time_filter == "Last week":
+                time_delta = timedelta(weeks=1)
+            
+            query["timestamp"] = {"$gte": datetime.utcnow() - time_delta}
+        
+        # Severity filter
+        severity_filter = self.alert_severity_var.get()
+        if severity_filter != "All":
+            query["severity"] = severity_filter.lower()
+        
+        # Sort by timestamp (newest first)
+        alerts = list(self.alerts_collection.find(query).sort("timestamp", -1))
+        
+        # Add alerts to treeview with severity coloring
+        for alert in alerts:
+            timestamp = alert["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            location = alert["location"]
+            parameter = PARAMETERS[alert["parameter"]]["name"]
+            value = f"{alert['value']:.2f} {PARAMETERS[alert['parameter']]['unit']}"
+            status = alert["status"]
+            severity = alert["severity"].lower()
+            
+            item = self.alerts_tree.insert("", "end", 
+                                         values=(timestamp, location, parameter, value, status, severity.upper()),
+                                         tags=(severity,))
+            
+            # Apply severity-based coloring
+            self.alerts_tree.item(item, tags=(severity,))
+
+    def create_heatmap(self, data, parameter, ax):
+        """Create heatmap with gradient-filled circles at each location"""
+        ax.clear()
+        
+        # Load Qatar map background
+        try:
+            qatar_map = Image.open("qatar-map.jpg")
+            ax.imshow(qatar_map, extent=(0, 500, 0, 500), zorder=0)
+        except FileNotFoundError:
+            ax.imshow(np.zeros((500, 500)), cmap="gray", extent=(0, 500, 0, 500), zorder=0)
+        
+        # Get parameter info
+        param_info = PARAMETERS[parameter]
+        min_val, max_val = param_info["range"]
+        safe_min, safe_max = param_info["safe_range"]
+        
+        # Create gradient circles for each location
+        for loc, (x, y) in LOCATIONS.items():
+            value = data[loc].get(parameter, 0)
+            norm_value = np.clip((value - min_val) / (max_val - min_val), 0, 1)
+            base_color = CMAP(norm_value)
+            
+            # Create gradient circle parameters
+            circle_radius = 60
+            n_points = 100
+            theta = np.linspace(0, 2*np.pi, n_points)
+            r = np.linspace(0, circle_radius, n_points)
+            Theta, R = np.meshgrid(theta, r)
+            
+            # Convert to Cartesian coordinates
+            X = x + R * np.cos(Theta)
+            Y = y + R * np.sin(Theta)
+            
+            # Create RGBA array for colors
+            colors = np.zeros((n_points, n_points, 4))
+            for i in range(n_points):
+                alpha = 0.8 * (1 - (i/n_points)**2)  # Quadratic fade
+                colors[i, :, :3] = base_color[:3]  # RGB from colormap
+                colors[i, :, 3] = alpha  # Alpha channel
+            
+            # Plot the gradient circle using imshow
+            extent = [x-circle_radius, x+circle_radius, y-circle_radius, y+circle_radius]
+            gradient_circle = np.zeros((n_points, n_points, 4))
+            for i in range(n_points):
+                for j in range(n_points):
+                    dist = np.sqrt((i-n_points//2)**2 + (j-n_points//2)**2)/(n_points//2)
+                    if dist <= 1.0:
+                        alpha = 0.8 * (1 - dist**2)
+                        gradient_circle[i,j,:3] = base_color[:3]
+                        gradient_circle[i,j,3] = alpha
+            
+            ax.imshow(gradient_circle, extent=extent, zorder=2, origin='lower')
+            
+            # Add value text (red if outside safe range)
+            text_color = 'white'
+            if value < safe_min or value > safe_max:
+                text_color = SEVERITY_COLORS[self.get_severity(parameter, value)]
+                
+            text = ax.text(x, y, f"{value:.1f}",
+                          color=text_color, ha='center', va='center',
+                          fontsize=12, fontweight='bold', zorder=3)
+            text.set_path_effects([
+                patheffects.Stroke(linewidth=3, foreground='black'),
+                patheffects.Normal()
+            ])
+        
+        # Add colorbar
+        sm = plt.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(vmin=min_val, vmax=max_val))
+        sm.set_array([])
+        if not hasattr(ax, 'cbar'):
+            ax.cbar = plt.colorbar(sm, ax=ax, shrink=0.7)
+            ax.cbar.set_label(f"{param_info['name']} ({param_info['unit']})", rotation=270, labelpad=15)
+        else:
+            ax.cbar.update_normal(sm)
+        
+        # Add safe range indicators
+        ax.cbar.ax.axhline((safe_min - min_val)/(max_val - min_val), color='lime', linestyle='--', linewidth=2)
+        ax.cbar.ax.axhline((safe_max - min_val)/(max_val - min_val), color='lime', linestyle='--', linewidth=2)
+        
+        # Set title and axis
+        ax.set_title(f"{param_info['name']} Distribution", fontsize=12, pad=10)
+        ax.axis('off')
+        ax.set_xlim(0, 500)
+        ax.set_ylim(0, 500)
+
+    def get_severity(self, parameter, value):
+        """Determine the severity level for a given parameter value"""
+        safe_min, safe_max = PARAMETERS[parameter]["safe_range"]
+        thresholds = PARAMETERS[parameter]["severity_thresholds"]
+        
+        if value < safe_min:
+            deviation = safe_min - value
+            if deviation >= thresholds["major"][0]:
+                return "major"
+            elif deviation >= thresholds["average"][0]:
+                return "average"
+            elif deviation >= thresholds["minor"][0]:
+                return "minor"
+        elif value > safe_max:
+            deviation = value - safe_max
+            if deviation >= thresholds["major"][1]:
+                return "major"
+            elif deviation >= thresholds["average"][1]:
+                return "average"
+            elif deviation >= thresholds["minor"][1]:
+                return "minor"
+        return "normal"
+
+    def update_history_graph(self):
+        """Update the history graph with selected parameters"""
+        try:
+            parameter = self.hist_param_var.get()
+            time_range = self.time_range_var.get()
+            location = int(self.location_var.get())
+            
+            # Calculate time delta
+            time_map = {
+                "5 min": 5,
+                "10 min": 10,
+                "30 min": 30,
+                "1 hour": 60,
+                "6 hours": 360,
+                "12 hours": 720
+            }
+            minutes = time_map.get(time_range, 30)
+            since_time = datetime.utcnow() - timedelta(minutes=minutes)
+            
+            # Get the correct collection based on location
+            collection_name = f"location{location}"
+            collection = self.db[collection_name]
+            
+            # Fetch historical data from the specific location collection
+            cursor = collection.find({
+                "timestamp": {"$gte": since_time}
+            }).sort("timestamp", 1)
+            
+            # Extract data
+            timestamps = []
+            values = []
+            for doc in cursor:
+                if parameter in doc:
+                    # Convert MongoDB timestamp to datetime
+                    if isinstance(doc["timestamp"], str):
+                        timestamp = datetime.strptime(doc["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z")
+                    else:
+                        timestamp = doc["timestamp"]
+                    timestamps.append(timestamp)
+                    values.append(doc[parameter])
+            
+            # Plot data
+            self.hist_ax.clear()
+            if timestamps:
+                # Plot main line
+                self.hist_ax.plot(timestamps, values, 
+                                marker='o', 
+                                linestyle='-',
+                                color='blue',
+                                label=f'Location {location}')
+                
+                # Add safe range lines
+                safe_min, safe_max = PARAMETERS[parameter]["safe_range"]
+                self.hist_ax.axhline(safe_min, color='green', linestyle='--', label='Safe Min')
+                self.hist_ax.axhline(safe_max, color='green', linestyle='--', label='Safe Max')
+                
+                # Highlight out-of-range values with severity colors
+                for t, v in zip(timestamps, values):
+                    if v < safe_min or v > safe_max:
+                        severity = self.get_severity(parameter, v)
+                        color = SEVERITY_COLORS.get(severity, "red")
+                        self.hist_ax.scatter(t, v, color=color, s=50, zorder=5)
+                
+                # Formatting
+                self.hist_ax.set_title(f"{PARAMETERS[parameter]['name']} History - Last {time_range}")
+                self.hist_ax.set_xlabel("Time")
+                self.hist_ax.set_ylabel(f"{PARAMETERS[parameter]['name']} ({PARAMETERS[parameter]['unit']})")
+                self.hist_ax.grid(True, alpha=0.3)
+                self.hist_ax.legend()
+                
+                # Format x-axis labels
+                self.hist_ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M:%S'))
+                for label in self.hist_ax.get_xticklabels():
+                    label.set_rotation(45)
+                    label.set_horizontalalignment('right')
+                
+                self.hist_fig.tight_layout()
+            
+            self.hist_canvas.draw()
+            
+        except Exception as e:
+            print(f"Error updating history graph: {e}")
+
+    def update_data(self):
+        """Update all heatmaps with fresh data"""
+        try:
+            data = self.fetch_data()
+            if data:
+                for i, param in enumerate(PARAMETERS):
+                    self.create_heatmap(data, param, self.axes[i])
+                    self.canvases[i].draw()
+            
+            # Update alerts view as well
+            self.update_alerts_view()
+            
+            # Schedule next update
+            self.root.after(1000, self.update_data)
+        except Exception as e:
+            print(f"Error updating data: {e}")
+            self.root.after(5000, self.update_data)  # Retry after 5 seconds
+    
+    def on_close(self):
+        """Clean up when closing the application"""
+        self.client.close()
+        self.root.destroy()
+
+    def update_existing_alerts(self):
+        """Update existing alerts to include severity field"""
+        # Get all alerts without severity field
+        alerts = list(self.alerts_collection.find({"severity": {"$exists": False}}))
+        
+        for alert in alerts:
+            # Determine severity based on value and parameter's safe range
+            param = alert["parameter"]
+            value = alert["value"]
+            safe_min, safe_max = PARAMETERS[param]["safe_range"]
+            thresholds = PARAMETERS[param]["severity_thresholds"]
+            
+            severity = None
+            if value < safe_min:
+                deviation = safe_min - value
+                if deviation >= thresholds["major"][0]:
+                    severity = "major"
+                elif deviation >= thresholds["average"][0]:
+                    severity = "average"
+                elif deviation >= thresholds["minor"][0]:
+                    severity = "minor"
+            elif value > safe_max:
+                deviation = value - safe_max
+                if deviation >= thresholds["major"][1]:
+                    severity = "major"
+                elif deviation >= thresholds["average"][1]:
+                    severity = "average"
+                elif deviation >= thresholds["minor"][1]:
+                    severity = "minor"
+            
+            # Update the alert with severity
+            if severity:
+                self.alerts_collection.update_one(
+                    {"_id": alert["_id"]},
+                    {"$set": {"severity": severity}}
+                )
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = WaterQualityDashboard(root)
+    self.update_existing_alerts()
+    root.mainloop()
