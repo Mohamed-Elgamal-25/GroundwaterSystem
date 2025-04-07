@@ -27,7 +27,7 @@ app.use(bodyParser.json());
  * The connection options ensure compatibility with newer MongoDB features.
  */
 mongoose.connect(
-    "mongodb+srv://60304859:12class34@watermonitoringsystem.quces.mongodb.net/watermonitoring", 
+    "mongodb+srv://username:password@watermonitoringsystem.quces.mongodb.net/watermonitoring", 
     { 
         useNewUrlParser: true,     // Use new URL parser
         useUnifiedTopology: true   // Use new server discovery and monitoring engine
